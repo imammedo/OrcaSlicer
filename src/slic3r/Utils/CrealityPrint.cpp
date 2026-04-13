@@ -148,7 +148,7 @@ bool CrealityPrint::upload(PrintHostUpload upload_data, ProgressFn prorgess_fn, 
 
             if (upload_data.post_action == PrintHostPostUploadAction::StartPrint) {
                 wxString errormsg;
-                if (!start_print(errormsg, safe_filename(upload_filename.string()))) {
+                if (!start_print(errormsg, safe_filename(upload_filename.string()), upload_data.extended_info)) {
                     error_fn(std::move(errormsg));
                     res = false;
                 }
@@ -211,6 +211,26 @@ static std::string ws_send_and_read(websocket::stream<beast::tcp_stream>& ws, co
     throw std::runtime_error("No '" + expected_key + "' response after " + std::to_string(max_reads) + " messages");
 }
 
+static void ws_connect(net::io_context& ioc, websocket::stream<beast::tcp_stream>& ws,
+                       const std::string& host_url, const std::string& port)
+{
+    std::string host = Http::get_host_from_url(host_url);
+
+    tcp::resolver resolver{ioc};
+    beast::get_lowest_layer(ws).expires_after(std::chrono::seconds(5));
+    auto const results = resolver.resolve(host, port);
+    beast::get_lowest_layer(ws).connect(results);
+    host += ':' + std::to_string(beast::get_lowest_layer(ws).socket().remote_endpoint().port());
+
+    beast::get_lowest_layer(ws).expires_never();
+    ws.set_option(websocket::stream_base::decorator(
+        [](websocket::request_type& req) {
+            req.set(http::field::user_agent,
+                std::string(BOOST_BEAST_VERSION_STRING) + " websocket-client-coro");
+        }));
+    ws.handshake(host, "/");
+}
+
 void CrealityPrint::query_model() const
 {
     if (!m_model.empty())
@@ -232,25 +252,9 @@ bool CrealityPrint::supports_multi_color_print() const
 std::string CrealityPrint::query_boxes_info() const
 {
     try {
-        std::string host = Http::get_host_from_url(m_host);
-        auto const port = "9999";
-
         net::io_context ioc;
-        tcp::resolver resolver{ioc};
         websocket::stream<beast::tcp_stream> ws{ioc};
-
-        beast::get_lowest_layer(ws).expires_after(std::chrono::seconds(5));
-        auto const results = resolver.resolve(host, port);
-        beast::get_lowest_layer(ws).connect(results);
-        host += ':' + std::to_string(beast::get_lowest_layer(ws).socket().remote_endpoint().port());
-
-        beast::get_lowest_layer(ws).expires_never();
-        ws.set_option(websocket::stream_base::decorator(
-            [](websocket::request_type& req) {
-                req.set(http::field::user_agent,
-                    std::string(BOOST_BEAST_VERSION_STRING) + " websocket-client-coro");
-            }));
-        ws.handshake(host, "/");
+        ws_connect(ioc, ws, m_host, "9999");
 
         json boxs_query = {{"method", "get"}, {"params", {{"boxsInfo", 1}}}};
         std::string result = ws_send_and_read(ws, boxs_query, "boxsInfo");
@@ -262,40 +266,76 @@ std::string CrealityPrint::query_boxes_info() const
     }
 }
 
-bool CrealityPrint::start_print(wxString &msg, const std::string &filename) const
+bool CrealityPrint::start_print(wxString &msg, const std::string &filename, const std::map<std::string, std::string>& extended_info) const
 {
     try {
-        std::string host = Http::get_host_from_url(m_host);
-        auto const port = "9999";
+        const std::string gcode_path = "/mnt/UDISK/printer_data/gcodes/" + filename;
 
         net::io_context ioc;
-
-        tcp::resolver resolver{ioc};
         websocket::stream<beast::tcp_stream> ws{ioc};
+        ws_connect(ioc, ws, m_host, "9999");
 
-        beast::get_lowest_layer(ws).expires_after(std::chrono::seconds(5));
-        auto const results = resolver.resolve(host, port);
-        beast::get_lowest_layer(ws).connect(results);
-        host += ':' + std::to_string(beast::get_lowest_layer(ws).socket().remote_endpoint().port());
+        if (supports_multi_color_print()) {
+            // Build colorMatch list from the mapping provided by the dialog
+            json color_list = json::array();
+            for (int i = 0; ; i++) {
+                auto it = extended_info.find("colorMatch_" + std::to_string(i));
+                if (it == extended_info.end())
+                    break;
+                // Value format: "toolId\ttype\tcolor\tboxId\tmaterialId"
+                auto val = it->second;
+                std::vector<std::string> parts;
+                std::istringstream iss(val);
+                std::string part;
+                while (std::getline(iss, part, '\t'))
+                    parts.push_back(part);
+                if (parts.size() >= 5) {
+                    color_list.push_back({
+                        {"id", parts[0]},
+                        {"type", parts[1]},
+                        {"color", parts[2]},
+                        {"boxId", std::stoi(parts[3])},
+                        {"materialId", std::stoi(parts[4])}
+                    });
+                }
+            }
 
-        beast::get_lowest_layer(ws).expires_never();
-        ws.set_option(websocket::stream_base::decorator(
-            [](websocket::request_type& req)
-            {
-                req.set(http::field::user_agent,
-                    std::string(BOOST_BEAST_VERSION_STRING) +
-                        " websocket-client-coro");
-            }));
+            json color_match = {
+                {"method", "set"},
+                {"params", {
+                    {"colorMatch", {
+                        {"path", gcode_path},
+                        {"list", color_list}
+                    }}
+                }}
+            };
+            ws_send_and_read(ws, color_match, "colorMatch");
 
-        ws.handshake(host, "/");
+            // Read enableSelfTest from extended_info, default to 0 (calibration off)
+            int enable_self_test = 0;
+            auto it = extended_info.find("enableSelfTest");
+            if (it != extended_info.end())
+                enable_self_test = std::stoi(it->second);
 
-        json cmd = {
-            {"method", "set"},
-            {"params", {
-                {"opGcodeFile", "printprt:/usr/data/printer_data/gcodes/" + filename}
-            }}
-        };
-        ws_send_and_read(ws, cmd, "opGcodeFile");
+            json multi_color_print = {
+                {"method", "set"},
+                {"params", {
+                    {"multiColorPrint", {
+                        {"gcode", gcode_path},
+                        {"enableSelfTest", enable_self_test}
+                    }}
+                }}
+            };
+            ws_send_and_read(ws, multi_color_print, "multiColorPrint");
+        } else {
+            json cmd = {
+                {"method", "set"},
+                {"params", {
+                    {"opGcodeFile", "printprt:/usr/data/printer_data/gcodes/" + filename}
+                }}
+            };
+            ws_send_and_read(ws, cmd, "opGcodeFile");
+        }
 
         ws.close(websocket::close_code::normal);
         return true;
