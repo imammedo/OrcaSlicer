@@ -229,6 +229,39 @@ bool CrealityPrint::supports_multi_color_print() const
         || m_model == "F021";   // K2
 }
 
+std::string CrealityPrint::query_boxes_info() const
+{
+    try {
+        std::string host = Http::get_host_from_url(m_host);
+        auto const port = "9999";
+
+        net::io_context ioc;
+        tcp::resolver resolver{ioc};
+        websocket::stream<beast::tcp_stream> ws{ioc};
+
+        beast::get_lowest_layer(ws).expires_after(std::chrono::seconds(5));
+        auto const results = resolver.resolve(host, port);
+        beast::get_lowest_layer(ws).connect(results);
+        host += ':' + std::to_string(beast::get_lowest_layer(ws).socket().remote_endpoint().port());
+
+        beast::get_lowest_layer(ws).expires_never();
+        ws.set_option(websocket::stream_base::decorator(
+            [](websocket::request_type& req) {
+                req.set(http::field::user_agent,
+                    std::string(BOOST_BEAST_VERSION_STRING) + " websocket-client-coro");
+            }));
+        ws.handshake(host, "/");
+
+        json boxs_query = {{"method", "get"}, {"params", {{"boxsInfo", 1}}}};
+        std::string result = ws_send_and_read(ws, boxs_query, "boxsInfo");
+        ws.close(websocket::close_code::normal);
+        return result;
+    } catch (std::exception const& e) {
+        BOOST_LOG_TRIVIAL(error) << "CrealityPrint: Failed to query boxsInfo: " << e.what();
+        return {};
+    }
+}
+
 bool CrealityPrint::start_print(wxString &msg, const std::string &filename) const
 {
     try {
