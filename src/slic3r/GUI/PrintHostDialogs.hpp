@@ -25,6 +25,8 @@ class wxStaticText;
 class wxWrapSizer;
 class CheckBox;
 
+namespace Slic3r { namespace GUI { class BitmapComboBox; } }
+
 namespace Slic3r {
 
 namespace GUI {
@@ -265,6 +267,16 @@ private:
 
     bool        m_enableSelfTest;
     PrintHost*  m_printhost;
+
+    struct SlotInfo {
+        std::string tool_id;   // e.g. "T1A"
+        std::string type;      // e.g. "PLA"
+        std::string color;     // e.g. "#ffffff"
+        int         box_id;
+        int         material_id;
+    };
+    std::vector<SlotInfo>   m_printer_slots;
+    std::vector<BitmapComboBox*> m_slot_combos; // one per gcode filament
 };
 
 wxDECLARE_EVENT(EVT_PRINTHOST_PROGRESS, PrintHostQueueDialog::Event);
