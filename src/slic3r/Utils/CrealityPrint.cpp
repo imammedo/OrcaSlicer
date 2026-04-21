@@ -186,32 +186,38 @@ std::string CrealityPrint::safe_filename(const std::string &filename) const
     return safe_filename;
 }
 
+static std::string ws_send_and_read(websocket::stream<beast::tcp_stream>& ws, const json& cmd, const std::string& expected_key, int max_reads = 5)
+{
+    ws.write(net::buffer(to_string(cmd)));
+
+    for (int i = 0; i < max_reads; i++) {
+        beast::get_lowest_layer(ws).expires_after(std::chrono::seconds(3));
+        beast::flat_buffer buf;
+        ws.read(buf);
+        std::string msg = beast::buffers_to_string(buf.data());
+        if (msg.find(expected_key) != std::string::npos)
+            return msg;
+    }
+    throw std::runtime_error("No '" + expected_key + "' response after " + std::to_string(max_reads) + " messages");
+}
+
 bool CrealityPrint::start_print(wxString &msg, const std::string &filename) const
 {
     try {
-        std::string host = m_host;
+        std::string host = Http::get_host_from_url(m_host);
         auto const port = "9999";
-
-        json j2 = {
-            { "method", "set" },
-            {
-                "params", {
-                    { "opGcodeFile", "printprt:/usr/data/printer_data/gcodes/" + filename }
-                }
-            }
-        };
 
         net::io_context ioc;
 
         tcp::resolver resolver{ioc};
-        websocket::stream<tcp::socket> ws{ioc};
+        websocket::stream<beast::tcp_stream> ws{ioc};
 
+        beast::get_lowest_layer(ws).expires_after(std::chrono::seconds(5));
         auto const results = resolver.resolve(host, port);
+        beast::get_lowest_layer(ws).connect(results);
+        host += ':' + std::to_string(beast::get_lowest_layer(ws).socket().remote_endpoint().port());
 
-        auto ep = net::connect(ws.next_layer(), results);
-
-        host += ':' + std::to_string(ep.port());
-
+        beast::get_lowest_layer(ws).expires_never();
         ws.set_option(websocket::stream_base::decorator(
             [](websocket::request_type& req)
             {
@@ -222,11 +228,13 @@ bool CrealityPrint::start_print(wxString &msg, const std::string &filename) cons
 
         ws.handshake(host, "/");
 
-        ws.write(net::buffer(to_string(j2)));
-
-        beast::flat_buffer buffer;
-
-        ws.read(buffer);
+        json cmd = {
+            {"method", "set"},
+            {"params", {
+                {"opGcodeFile", "printprt:/usr/data/printer_data/gcodes/" + filename}
+            }}
+        };
+        ws_send_and_read(ws, cmd, "opGcodeFile");
 
         ws.close(websocket::close_code::normal);
         return true;
