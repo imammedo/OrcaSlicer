@@ -148,7 +148,7 @@ bool CrealityPrint::upload(PrintHostUpload upload_data, ProgressFn prorgess_fn, 
 
             if (upload_data.post_action == PrintHostPostUploadAction::StartPrint) {
                 wxString errormsg;
-                if (!start_print(errormsg, safe_filename(upload_filename.string()))) {
+                if (!start_print(errormsg, safe_filename(upload_filename.string()), upload_data.extended_info)) {
                     error_fn(std::move(errormsg));
                     res = false;
                 }
@@ -276,27 +276,79 @@ std::string CrealityPrint::query_boxes_info() const
     }
 }
 
-bool CrealityPrint::start_print(wxString &msg, const std::string &filename) const
+bool CrealityPrint::start_print(wxString &msg, const std::string &filename, const std::map<std::string, std::string>& extended_info) const
 {
     try {
+        const std::string gcode_path = "/mnt/UDISK/printer_data/gcodes/" + filename;
+
         net::io_context ioc;
         websocket::stream<beast::tcp_stream> ws{ioc};
         ws_connect(ioc, ws, m_host, "9999");
 
-        json j2 = {
-            { "method", "set" },
-            {
-                "params", {
-                    { "opGcodeFile", "printprt:/usr/data/printer_data/gcodes/" + filename }
+        if (supports_multi_color_print()) {
+            // Build colorMatch list from the mapping provided by the dialog
+            json color_list = json::array();
+            for (int i = 0; ; i++) {
+                auto it = extended_info.find("colorMatch_" + std::to_string(i));
+                if (it == extended_info.end())
+                    break;
+                // Value format: "toolId\ttype\tcolor\tboxId\tmaterialId"
+                auto val = it->second;
+                std::vector<std::string> parts;
+                std::istringstream iss(val);
+                std::string part;
+                while (std::getline(iss, part, '\t'))
+                    parts.push_back(part);
+                if (parts.size() >= 5) {
+                    color_list.push_back({
+                        {"id", parts[0]},
+                        {"type", parts[1]},
+                        {"color", parts[2]},
+                        {"boxId", std::stoi(parts[3])},
+                        {"materialId", std::stoi(parts[4])}
+                    });
                 }
             }
-        };
 
-        ws.write(net::buffer(to_string(j2)));
+            json color_match = {
+                {"method", "set"},
+                {"params", {
+                    {"colorMatch", {
+                        {"path", gcode_path},
+                        {"list", color_list}
+                    }}
+                }}
+            };
+            ws_send_and_read(ws, color_match, "colorMatch");
 
-        beast::flat_buffer buffer;
+            // Read enableSelfTest from extended_info, default to 0 (calibration off)
+            int enable_self_test = 0;
+            auto it = extended_info.find("enableSelfTest");
+            if (it != extended_info.end())
+                enable_self_test = std::stoi(it->second);
 
-        ws.read(buffer);
+            json multi_color_print = {
+                {"method", "set"},
+                {"params", {
+                    {"multiColorPrint", {
+                        {"gcode", gcode_path},
+                        {"enableSelfTest", enable_self_test}
+                    }}
+                }}
+            };
+            ws_send_and_read(ws, multi_color_print, "multiColorPrint");
+        } else {
+            json cmd = {
+                {"method", "set"},
+                {"params", {
+                    {"opGcodeFile", "printprt:/usr/data/printer_data/gcodes/" + filename}
+                }}
+            };
+            ws.write(net::buffer(to_string(cmd)));
+
+            beast::flat_buffer buffer;
+            ws.read(buffer);
+        }
 
         return true;
     } catch(std::exception const& e) {
