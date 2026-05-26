@@ -210,7 +210,8 @@ private:
         int         material_id;
     };
     std::vector<SlotInfo>   m_printer_slots;
-    std::vector<BitmapComboBox*> m_slot_combos; // one per gcode filament
+    std::vector<BitmapComboBox*> m_slot_combos;      // one per used gcode filament
+    std::vector<int>             m_combo_filament_idx; // original gcode filament index for each combo
 };
 
 wxDECLARE_EVENT(EVT_PRINTHOST_PROGRESS, PrintHostQueueDialog::Event);
